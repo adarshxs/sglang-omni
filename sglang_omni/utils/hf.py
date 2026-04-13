@@ -27,6 +27,10 @@ _CONFIG_MODEL_TYPE_TO_ARCH = {
     "voxtral_tts": "VoxtralTTSForConditionalGeneration",
 }
 
+_RAW_CONFIG_ARCH_TO_ARCH = {
+    "voxcpm2": "VoxCPM2ForConditionalGeneration",
+}
+
 
 def architecture_from_hf_config(hf_config: Any) -> str | None:
     """Prefer HF ``architectures``; fall back to ``model_type`` when needed."""
@@ -70,6 +74,33 @@ def try_resolve_arch_from_mistral_config(model_path: str) -> str | None:
         return None
     model_type = params.get("model_type", "")
     return _CONFIG_MODEL_TYPE_TO_ARCH.get(model_type)
+
+
+def load_raw_config_json(model_path: str) -> dict | None:
+    """Load a raw non-HF ``config.json`` from a local dir or Hub id."""
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path) as f:
+            return json.load(f)
+    if os.path.isdir(model_path):
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+
+        cached = hf_hub_download(repo_id=model_path, filename="config.json")
+        with open(cached) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def try_resolve_arch_from_raw_config(model_path: str) -> str | None:
+    """Resolve architecture from raw non-HF ``config.json`` metadata."""
+    config = load_raw_config_json(model_path)
+    if config is None:
+        return None
+    architecture = str(config.get("architecture", "")).lower()
+    return _RAW_CONFIG_ARCH_TO_ARCH.get(architecture)
 
 
 # ---------------------------------------------------------------------------

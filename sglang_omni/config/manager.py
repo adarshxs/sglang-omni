@@ -9,6 +9,7 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.utils.hf import (
     architecture_from_hf_config,
     try_resolve_arch_from_mistral_config,
+    try_resolve_arch_from_raw_config,
 )
 
 
@@ -112,11 +113,16 @@ class ConfigManager:
         if arch is None:
             arch = try_resolve_arch_from_mistral_config(model_path)
 
+        # 3) Raw non-HF config.json (e.g. VoxCPM2) when standard HF loading is absent
+        if arch is None:
+            arch = try_resolve_arch_from_raw_config(model_path)
+
         if arch is None:
             raise ValueError(
                 f"Could not resolve model architecture for {model_path!r}. "
                 "Use a Hugging Face model id or a local directory with config.json "
-                "(architectures) or Mistral params.json (model_type, e.g. voxtral_tts)."
+                "(architectures / raw architecture) or Mistral params.json "
+                "(model_type, e.g. voxtral_tts)."
             )
 
         config_cls = PIPELINE_CONFIG_REGISTRY.get_config(arch)

@@ -37,6 +37,11 @@ _SGLANG_EXPORTS = {
     "SGLangOutputProcessor",
     "SGLangIterationController",
     "SGLangModelRunner",
+    "NativeAdapterRequestData",
+    "NativeAdapterStepResult",
+    "NativeAdapterOutputProcessor",
+    "NativeAdapterIterationController",
+    "NativeAdapterModelRunner",
 }
 
 __all__ = [
@@ -70,11 +75,20 @@ __all__ = [
     "SGLangOutputProcessor",
     "SGLangIterationController",
     "SGLangModelRunner",
+    "NativeAdapterRequestData",
+    "NativeAdapterStepResult",
+    "NativeAdapterOutputProcessor",
+    "NativeAdapterIterationController",
+    "NativeAdapterModelRunner",
 ]
 
 
 def __getattr__(name: str):
     if name in _SGLANG_EXPORTS:
+        if name.startswith("NativeAdapter"):
+            from . import native_adapter
+
+            return getattr(native_adapter, name)
         from . import sglang_ar
 
         return getattr(sglang_ar, name)

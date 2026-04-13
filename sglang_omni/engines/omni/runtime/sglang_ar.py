@@ -549,7 +549,7 @@ class SGLangModelRunner:
         self, forward_batch: Any, schedule_batch: Any
     ) -> tuple[torch.Tensor | None, list | None, torch.Tensor | None]:
 
-        if not any(req.omni_model_inputs is not None for req in schedule_batch.reqs):
+        if not any(getattr(req, "omni_model_inputs", req.multimodal_inputs) is not None for req in schedule_batch.reqs):
             return None, None, None
 
         device = forward_batch.input_ids.device
@@ -579,7 +579,7 @@ class SGLangModelRunner:
         has_deepstack = False
 
         for i, req in enumerate(schedule_batch.reqs):
-            omni_inputs = req.omni_model_inputs
+            omni_inputs = getattr(req, "omni_model_inputs", req.multimodal_inputs)
             if omni_inputs is None:
                 continue
 
@@ -684,7 +684,9 @@ class SGLangModelRunner:
                     visual_pos_masks_list.append(global_mask)
 
             if req.is_chunked == 0:
-                req.omni_model_inputs = None
+                if hasattr(req, "omni_model_inputs"):
+                    req.omni_model_inputs = None
+                req.multimodal_inputs = None
                 req._omni_consumed = None
 
         ds_embeds_out = None
