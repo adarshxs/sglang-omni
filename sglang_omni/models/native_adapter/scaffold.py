@@ -1,6 +1,45 @@
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
+import torch
+
+
+@dataclass
+class NativeAdapterRequestState:
+    """Per-request state owned by a scaffold-backed native adapter."""
+
+    prompt_text: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    state: Any = None
+    latest_multimodal_outputs: dict[str, Any] = field(default_factory=dict)
+    finish_reason: str | None = None
+    usage: dict[str, Any] | None = None
+
+
+@dataclass
+class NativeAdapterStepResult:
+    """Per-step side results produced by a scaffold-backed native adapter."""
+
+    token_id: int | None = None
+    finished: bool = False
+    finish_reason: str | None = None
+    next_input_embeds: torch.Tensor | None = None
+    multimodal_outputs: dict[str, Any] = field(default_factory=dict)
+    usage: dict[str, Any] | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class NativeAdapterModel(Protocol):
+    """Minimal model-local contract for scaffold-backed native adapters."""
+
+    def set_native_adapter_requests(self, requests: list[Any]) -> None: ...
+
+    def clear_native_adapter_requests(self) -> None: ...
+
+    def pop_native_adapter_result(self, request_id: str) -> Any | None: ...
 
 
 class NativeAdapterScaffoldMixin:

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 import torch
 from transformers import LlamaTokenizerFast
 
-from sglang_omni.engines import create_sglang_native_adapter_engine
+from sglang_omni.engines import create_sglang_ar_engine
 from sglang_omni.executors import EngineExecutor, PreprocessingExecutor
 from sglang_omni.models.native_adapter import PatchAudioAccumulator
 from sglang_omni.models.voxcpm2.audio_vae import load_voxcpm2_audio_vae
+from sglang_omni.models.voxcpm2.audio_vae_native import AudioVAEConfigV2
 from sglang_omni.models.voxcpm2.hf_config import ensure_voxcpm2_scaffold_config
 from sglang_omni.models.voxcpm2.io import VoxCPM2GenerationConfig, VoxCPM2State
 from sglang_omni.models.voxcpm2.pipeline.engine_io import (
@@ -20,6 +22,8 @@ from sglang_omni.models.voxcpm2.pipeline.next_stage import GENERATION_STAGE
 from sglang_omni.models.voxcpm2.pipeline.state_io import load_state, store_state
 from sglang_omni.models.weight_loader import resolve_model_path
 from sglang_omni.proto import StagePayload
+from sglang_omni.utils.hf import load_raw_config_json
+from sglang_omni.models.voxcpm2.utils import mask_multichar_chinese_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +37,41 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
 
         if isinstance(inputs, str):
             text = inputs
+            prompt_text = None
+            prompt_audio = None
+            reference_audio = None
         elif isinstance(inputs, dict):
-            text = inputs.get("text", "")
+            additional = inputs.get("additional_information") or {}
+            text = (
+                inputs.get("text")
+                or inputs.get("prompt")
+                or inputs.get("input")
+                or ""
+            )
+            prompt_text = inputs.get("prompt_text") or additional.get("prompt_text")
+            prompt_audio = inputs.get("prompt_audio") or additional.get("prompt_audio")
+            reference_audio = (
+                inputs.get("reference_audio")
+                or additional.get("reference_audio")
+                or inputs.get("ref_audio")
+                or additional.get("ref_audio")
+            )
+            if isinstance(prompt_audio, list) and len(prompt_audio) == 1:
+                prompt_audio = prompt_audio[0]
+            if isinstance(reference_audio, list) and len(reference_audio) == 1:
+                reference_audio = reference_audio[0]
         else:
             text = str(inputs) if inputs is not None else ""
+            prompt_text = None
+            prompt_audio = None
+            reference_audio = None
 
         if not text or not text.strip():
             raise ValueError("VoxCPM2 requires a non-empty input text.")
+        if (prompt_audio is None) != (prompt_text is None):
+            raise ValueError(
+                "VoxCPM2 continuation mode requires both prompt_audio and prompt_text."
+            )
 
         stage_params = params.get("stage_params") or {}
         generation_params = (
@@ -49,6 +81,9 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
         )
         state = VoxCPM2State(
             text=text,
+            prompt_text=prompt_text,
+            prompt_audio=prompt_audio,
+            reference_audio=reference_audio,
             generation=VoxCPM2GenerationConfig(
                 max_new_tokens=int(
                     generation_params.get(
@@ -80,14 +115,23 @@ def create_generation_executor(
     from sglang_omni.models.voxcpm2.hf_config import VoxCPM2HFConfig
 
     # Register the custom config type before ServerArgs.__post_init__ tries
-    # AutoConfig.from_pretrained on the scaffold config file.
+    # AutoConfig.from_pretrained on the generated native config file.
     try:
-        AutoConfig.register("voxcpm2_scaffold", VoxCPM2HFConfig)
+        AutoConfig.register("voxcpm2_native", VoxCPM2HFConfig)
     except ValueError:
         pass  # already registered
 
     resolved_model_path, config_file = ensure_voxcpm2_scaffold_config(model_path)
-    tokenizer = LlamaTokenizerFast.from_pretrained(resolved_model_path)
+    raw_config = load_raw_config_json(resolved_model_path) or {}
+    tokenizer = mask_multichar_chinese_tokens(
+        LlamaTokenizerFast.from_pretrained(resolved_model_path)
+    )
+    audio_vae_cfg = AudioVAEConfigV2.model_validate(
+        raw_config.get("audio_vae_config") or {}
+    )
+    encode_sample_rate = int(audio_vae_cfg.sample_rate)
+    chunk_size = int(math.prod(audio_vae_cfg.encoder_rates))
+    patch_size = int(raw_config.get("patch_size", 4))
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
     server_args = ServerArgs(
@@ -97,16 +141,16 @@ def create_generation_executor(
         mem_fraction_static=mem_fraction_static,
         chunked_prefill_size=8192,
         max_prefill_tokens=8192,
-        max_running_requests=1,
+        max_running_requests=4,
         disable_cuda_graph=True,
         trust_remote_code=True,
         decrypted_config_file=config_file,
     )
 
-    engine = create_sglang_native_adapter_engine(
+    engine = create_sglang_ar_engine(
         server_args=server_args,
         gpu_id=gpu_id,
-        model_arch_override="VoxCPM2MiniCPMScaffoldForCausalLM",
+        model_arch_override="VoxCPM2ForCausalLM",
     )
     hidden_size = engine.model_runner.model_worker.model_config.hidden_size
 
@@ -117,6 +161,9 @@ def create_generation_executor(
             tokenizer=tokenizer,
             hidden_size=hidden_size,
             request_id=payload.request_id,
+            encode_sample_rate=encode_sample_rate,
+            chunk_size=chunk_size,
+            patch_size=patch_size,
         )
 
     def _result_builder(payload: StagePayload, result: Any) -> StagePayload:

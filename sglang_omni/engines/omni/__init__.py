@@ -6,7 +6,6 @@ from .factory import (
     create_ar_engine,
     create_encoder_engine,
     create_sglang_ar_engine,
-    create_sglang_native_adapter_engine,
     create_single_pass_engine,
 )
 from .model_runner import ModelRunner
@@ -42,7 +41,6 @@ __all__ = [
     # AR (SGLang)
     "SGLangARRequestData",
     "create_sglang_ar_engine",
-    "create_sglang_native_adapter_engine",
 ]
 
 

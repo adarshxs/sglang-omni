@@ -297,12 +297,20 @@ def create_sglang_ar_engine(
     output_proc = SGLangOutputProcessor(
         capture_hidden=capture_hidden,
         capture_hidden_layers=capture_hidden_layers,
-        model=model_worker.model_runner.model if capture_hidden_layers else None,
+        model=model_worker.model_runner.model,
     )
 
     if stream_adapter is None:
 
         def stream_adapter(request, output):
+            native_adapter = getattr(request.data, "native_adapter", None)
+            latest = (
+                native_adapter.latest_multimodal_outputs
+                if native_adapter is not None
+                else None
+            )
+            if isinstance(latest, dict) and latest:
+                return latest
             if request.data.req.is_chunked > 0:
                 return None
             token = output.data
@@ -326,101 +334,4 @@ def create_sglang_ar_engine(
         model_runner=sglang_model_runner,
         enable_overlap=enable_overlap,
         feedback_mailbox=feedback_mailbox,
-    )
-
-
-def create_sglang_native_adapter_engine(
-    server_args: Any,
-    *,
-    gpu_id: int = 0,
-    enable_overlap: bool | None = None,
-    stream_adapter=None,
-    model_arch_override: str | None = None,
-    weight_prefix: str | None = None,
-) -> OmniEngine:
-    """Create an SGLang-backed engine for scaffold-native adapter models."""
-    from sglang_omni.engines.ar.sglang_backend.model_worker import (
-        ModelWorker,
-        ModelWorkerConfig,
-    )
-    from sglang_omni.engines.ar.sglang_backend.scheduler.cache import create_tree_cache
-    from sglang_omni.engines.ar.sglang_backend.scheduler.decode import DecodeManager
-    from sglang_omni.engines.ar.sglang_backend.scheduler.prefill import PrefillManager
-
-    from .runtime.native_adapter import (
-        NativeAdapterIterationController,
-        NativeAdapterModelRunner,
-        NativeAdapterOutputProcessor,
-    )
-    from .runtime.sglang_ar import SGLangBatchPlanner, SGLangResourceManager
-
-    if enable_overlap is None:
-        enable_overlap = not getattr(server_args, "disable_overlap_schedule", False)
-
-    model_worker = ModelWorker(
-        config=ModelWorkerConfig(
-            model_arch_override=model_arch_override,
-            weight_prefix=weight_prefix,
-        ),
-        server_args=server_args,
-        gpu_id=gpu_id,
-    )
-
-    req_to_token_pool, token_to_kv_pool_allocator = model_worker.get_memory_pool()
-    tree_cache = create_tree_cache(
-        server_args,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        server_args.page_size,
-    )
-
-    prefill_mgr = PrefillManager(
-        page_size=server_args.page_size,
-        chunked_prefill_size=server_args.chunked_prefill_size,
-        max_prefill_tokens=server_args.max_prefill_tokens,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        tree_cache=tree_cache,
-        model_config=model_worker.model_config,
-        enable_overlap=enable_overlap,
-    )
-    decode_mgr = DecodeManager(
-        server_args=server_args,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        on_retract=lambda req: prefill_mgr.add_one_request(req),
-    )
-
-    batch_planner = SGLangBatchPlanner(prefill_mgr, decode_mgr, server_args)
-    resource_mgr = SGLangResourceManager(
-        token_to_kv_pool_allocator, req_to_token_pool, tree_cache
-    )
-    iteration_ctrl = NativeAdapterIterationController(tree_cache)
-    output_proc = NativeAdapterOutputProcessor(model_worker.model_runner.model)
-
-    if stream_adapter is None:
-
-        def stream_adapter(request, output):
-            latest = getattr(request.data, "latest_multimodal_outputs", None)
-            if isinstance(latest, dict) and latest:
-                return latest
-            token = output.data
-            return int(token) if token is not None else None
-
-    scheduler = Scheduler(
-        batch_planner=batch_planner,
-        resource_manager=resource_mgr,
-        iteration_controller=iteration_ctrl,
-        stream_adapter=stream_adapter,
-    )
-    batch_planner._abort_callback = scheduler.abort_request
-    model_runner = NativeAdapterModelRunner(
-        model_worker,
-        output_proc,
-        batch_planner=batch_planner,
-    )
-
-    return OmniEngine(
-        scheduler=scheduler,
-        model_runner=model_runner,
-        enable_overlap=enable_overlap,
     )

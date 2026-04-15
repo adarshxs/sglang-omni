@@ -1,31 +1,24 @@
 # VoxCPM2 TTS Usage
 
-This guide covers the first VoxCPM2 integration milestone in `sglang-omni`.
+This guide covers the native VoxCPM2 integration in `sglang-omni`.
 
 Current scope:
 
 - Plain text -> speech
+- Reference-audio voice cloning
+- Prompt-audio continuation
 - 48 kHz waveform output
-- Native VoxCPM2 side computation behind an SGLang-backed scaffold loop
+- Native VoxCPM2 side modules in-tree
+- SGLang-backed MiniCPM4 base/residual LM execution
 
 Not included yet:
 
-- Reference-audio voice cloning
-- Prompt-audio continuation
 - Incremental streaming decode
-- Deep paged-KV / batched native-side optimization
+- OpenAI speech endpoint wiring specific to VoxCPM2 request extras
 
 ## Prerequisites
 
-Install the upstream `voxcpm` package, or point `sglang-omni` at a source checkout:
-
-```bash
-# Option A
-pip install voxcpm
-
-# Option B
-export SGLANG_OMNI_VOXCPM_CODE_PATH=/path/to/VoxCPM
-```
+Install the normal `sglang-omni` dependencies. No separate `voxcpm` package or source checkout is required anymore.
 
 ## Launch
 
@@ -49,7 +42,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 ## Optional Generation Controls
 
-The first implementation exposes VoxCPM2-native generation knobs through stage params on the `generation` stage:
+VoxCPM2 exposes generation knobs through stage params on the `generation` stage:
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
@@ -70,14 +63,14 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 ## Notes
 
-- The pipeline currently loads only a lightweight AudioVAE stage separately; the full native VoxCPM2 stack lives in the generation stage.
-- The native side still runs request-local residual LM + diffusion logic, so this first milestone is aimed at correctness and future extensibility rather than peak throughput.
+- The pipeline keeps the three-stage layout: preprocessing -> latent generation -> audio decode.
+- Generation runs a native VoxCPM2 model class that owns the SGLang-backed MiniCPM4 base/residual LMs plus the in-tree FSQ / LocEnc / LocDiT stack.
+- Audio decode still happens in a separate stage so latent patches remain the interface between generation and waveform reconstruction.
 
 ## Follow-Up Optimization Path
 
-The compatibility-first integration is intentionally a stepping stone. The natural next optimizations are:
+The native port is now correctness-first but self-contained. The natural next optimizations are:
 
-- Replace the scaffold-only MiniCPM path with a truly optimized paged-KV MiniCPM4 execution path.
-- Remove the current batch-1 native-side assumption by isolating request-local residual LM / diffusion state more cleanly.
+- Tune the batched VoxCPM2 request path and scheduler limits for larger concurrent decode loads.
+- Add selective `torch.compile` / CUDA graph capture to the diffusion-heavy parts once runtime behavior is stable.
 - Add sliding-window or incremental AudioVAE decode so streaming does not require full waveform re-decode.
-- Revisit CUDA graph and overlap settings once the native-side execution path is stable.

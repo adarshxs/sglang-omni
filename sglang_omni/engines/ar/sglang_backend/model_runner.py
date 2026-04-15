@@ -76,19 +76,20 @@ class SGLModelRunner(ModelRunner):
         from sglang_omni.models.qwen3_omni.talker import Qwen3OmniTalker
         from sglang_omni.models.voxcpm2.hf_config import VoxCPM2HFConfig
         from sglang_omni.models.voxcpm2.sglang_model import (
-            VoxCPM2MiniCPMScaffoldForCausalLM,
+            VoxCPM2ForCausalLM,
         )
 
         ModelRegistry.models["S2ProSGLangTextModel"] = S2ProSGLangTextModel
         ModelRegistry.models["Qwen3OmniTalker"] = Qwen3OmniTalker
         ModelRegistry.models["BailingMoeV2ForCausalLM"] = BailingMoeV2ForCausalLM
-        ModelRegistry.models["VoxCPM2MiniCPMScaffoldForCausalLM"] = (
-            VoxCPM2MiniCPMScaffoldForCausalLM
-        )
+        ModelRegistry.models["VoxCPM2ForCausalLM"] = VoxCPM2ForCausalLM
 
         # Register BailingMM2Config with AutoConfig so SGLang can load
         # config.json from HF repos missing configuration_bailingmm2.py.
         from transformers import AutoConfig
 
         AutoConfig.register("bailingmm_moe_v2_lite", BailingMM2Config)
-        AutoConfig.register("voxcpm2_scaffold", VoxCPM2HFConfig)
+        try:
+            AutoConfig.register("voxcpm2_native", VoxCPM2HFConfig)
+        except ValueError:
+            pass

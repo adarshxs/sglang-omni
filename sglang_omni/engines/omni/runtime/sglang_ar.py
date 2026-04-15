@@ -10,6 +10,11 @@ import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
 
+from sglang_omni.models.native_adapter import (
+    NativeAdapterModel,
+    NativeAdapterRequestState,
+)
+
 from ..types import (
     ModelRunnerOutput,
     RequestOutput,
@@ -35,6 +40,10 @@ class SGLangARRequestData(ARRequestData):
     synced: bool = False
     generation_steps: int = 0
     suppress_tokens: list[int] | None = None
+    feedback_embeds: torch.Tensor | None = None
+    input_embeds_are_projected: bool = False
+    stop_token_ids: tuple[int, ...] = ()
+    native_adapter: NativeAdapterRequestState | None = None
 
 
 class SGLangBatchPlanner:
@@ -331,6 +340,9 @@ class SGLangOutputProcessor:
         self._capture_hidden = capture_hidden
         self._capture_hidden_layers = capture_hidden_layers
         self._model = model
+        self._adapter_model = (
+            model if isinstance(model, NativeAdapterModel) else None
+        )
 
     def process(
         self,
@@ -368,6 +380,15 @@ class SGLangOutputProcessor:
                             if stream_hidden_states.ndim >= 2
                             else stream_hidden_states
                         )
+            step_result = self._pop_model_step_result(sched_req.request_id)
+            if step_result is not None:
+                outputs[sched_req.request_id] = self._build_request_output_from_step_result(
+                    sched_req.request_id,
+                    token_id,
+                    extra,
+                    step_result,
+                )
+                continue
             outputs[sched_req.request_id] = RequestOutput(
                 request_id=sched_req.request_id,
                 data=token_id,
@@ -375,6 +396,52 @@ class SGLangOutputProcessor:
                 extra=extra,
             )
         return outputs
+
+    def _pop_model_step_result(self, request_id: str) -> Any | None:
+        if self._adapter_model is None:
+            return None
+        return self._adapter_model.pop_native_adapter_result(request_id)
+
+    @staticmethod
+    def _merge_extra_dicts(
+        base: dict[str, Any] | None, update: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if not base and not update:
+            return None
+        merged = dict(base or {})
+        if update:
+            merged.update(update)
+        return merged
+
+    def _build_request_output_from_step_result(
+        self,
+        request_id: str,
+        token_id: int | None,
+        extra: dict[str, Any] | None,
+        step_result: Any,
+    ) -> RequestOutput:
+        result_token = getattr(step_result, "token_id", token_id)
+        merged_extra = dict(extra or {})
+        next_input_embeds = getattr(step_result, "next_input_embeds", None)
+        if next_input_embeds is not None:
+            merged_extra["_next_input_embeds"] = next_input_embeds
+        multimodal_outputs = getattr(step_result, "multimodal_outputs", None)
+        if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+            merged_extra["multimodal_outputs"] = multimodal_outputs
+        usage = getattr(step_result, "usage", None)
+        if isinstance(usage, dict):
+            merged_extra["usage"] = usage
+        merged_extra = self._merge_extra_dicts(
+            merged_extra,
+            getattr(step_result, "extra", None),
+        )
+        return RequestOutput(
+            request_id=request_id,
+            data=result_token,
+            finished=bool(getattr(step_result, "finished", False)),
+            finish_reason=getattr(step_result, "finish_reason", None),
+            extra=merged_extra,
+        )
 
     def _extract_hidden_states(
         self, model_output: Any
@@ -440,6 +507,8 @@ class SGLangIterationController:
         data = request.data
         if data.req.is_chunked > 0:
             return False
+        if output.finished or output.finish_reason is not None:
+            return False
         if data.req.finished():
             return False
         # Decode steps need feedback (not prefill)
@@ -475,6 +544,19 @@ class SGLangIterationController:
             req.is_chunked -= 1
             return
 
+        extra = output.extra or {}
+        data.feedback_embeds = extra.get("_next_input_embeds")
+        native_adapter = getattr(data, "native_adapter", None)
+        multimodal_outputs = extra.get("multimodal_outputs")
+        if native_adapter is not None and isinstance(multimodal_outputs, dict):
+            native_adapter.latest_multimodal_outputs = multimodal_outputs
+        usage = extra.get("usage")
+        if native_adapter is not None and isinstance(usage, dict):
+            native_adapter.usage = usage
+        if output.finish_reason is not None:
+            if native_adapter is not None:
+                native_adapter.finish_reason = output.finish_reason
+
         token_id = output.data
         if token_id is not None:
             req.output_ids.append(token_id)
@@ -495,6 +577,21 @@ class SGLangIterationController:
             )
 
     def is_finished(self, request: SchedulerRequest, output: RequestOutput) -> bool:
+        data: SGLangARRequestData = request.data
+        if output.finished:
+            return True
+        if output.finish_reason is not None:
+            return True
+        if output.data is not None and output.data in set(data.stop_token_ids):
+            return True
+        max_tokens = data.max_new_tokens or getattr(
+            data.req.sampling_params, "max_new_tokens", None
+        )
+        if max_tokens is not None and data.generation_steps >= max_tokens:
+            native_adapter = getattr(data, "native_adapter", None)
+            if native_adapter is not None:
+                native_adapter.finish_reason = native_adapter.finish_reason or "length"
+            return True
         return request.data.req.finished()
 
 
@@ -959,102 +1056,114 @@ class SGLangModelRunner:
             ForwardBatch,
         )
 
-        # Ensure correct CUDA device context when running in thread pool
-        if self.device.type == "cuda":
-            torch.cuda.set_device(self.device)
-
-        schedule_batch = scheduler_output.batch_data
-
-        if schedule_batch is None:
-            return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
-
-        model_worker_batch = schedule_batch.get_model_worker_batch()
-
-        # Enable hidden state capture if output processor needs it
-        if self.output_processor._capture_hidden:
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.model_worker.model_runner
-        )
-
-        omni_embeds = None
-        if schedule_batch.forward_mode.is_extend():
-            omni_embeds = self._inject_multimodal_embeds(forward_batch, schedule_batch)
-        feedback_input_embeds = self._build_feedback_input_embeds(
-            forward_batch, schedule_batch
-        )
-        request_prefill_input_embeds = (
-            self._rebuild_prefill_input_embeds(scheduler_output.requests)
-            if schedule_batch.forward_mode.is_extend()
+        adapter_model = (
+            self._inner_model
+            if isinstance(self._inner_model, NativeAdapterModel)
             else None
         )
-        has_projected_prefill = (
-            any(
-                self._request_uses_projected_prefill(req)
-                for req in scheduler_output.requests
+        if adapter_model is not None:
+            adapter_model.set_native_adapter_requests(scheduler_output.requests)
+
+        try:
+            # Ensure correct CUDA device context when running in thread pool
+            if self.device.type == "cuda":
+                torch.cuda.set_device(self.device)
+
+            schedule_batch = scheduler_output.batch_data
+
+            if schedule_batch is None:
+                return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
+
+            model_worker_batch = schedule_batch.get_model_worker_batch()
+
+            # Enable hidden state capture if output processor needs it
+            if self.output_processor._capture_hidden:
+                model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.model_worker.model_runner
             )
-            or request_prefill_input_embeds is not None
-        )
-        projected_prefill = (
-            self._is_talker_model
-            and schedule_batch.forward_mode.is_extend()
-            and has_projected_prefill
-        )
-        if omni_embeds is not None and omni_embeds[0] is not None:
-            input_embeds, ds_embeds, vis_masks = omni_embeds
-            batch_result = self._forward_with_omni_embeds(
-                forward_batch, input_embeds, ds_embeds, vis_masks
+
+            omni_embeds = None
+            if schedule_batch.forward_mode.is_extend():
+                omni_embeds = self._inject_multimodal_embeds(forward_batch, schedule_batch)
+            feedback_input_embeds = self._build_feedback_input_embeds(
+                forward_batch, schedule_batch
             )
-        elif projected_prefill:
-            projected_input_embeds = request_prefill_input_embeds
-            if projected_input_embeds is None:
-                projected_input_embeds = forward_batch.input_embeds
-            if projected_input_embeds is None:
-                raise RuntimeError(
-                    "Projected talker prefill requested without input_embeds"
+            request_prefill_input_embeds = (
+                self._rebuild_prefill_input_embeds(scheduler_output.requests)
+                if schedule_batch.forward_mode.is_extend()
+                else None
+            )
+            has_projected_prefill = (
+                any(
+                    self._request_uses_projected_prefill(req)
+                    for req in scheduler_output.requests
                 )
-            batch_result = self._forward_talker(
-                forward_batch,
-                input_embeds=projected_input_embeds,
-                input_embeds_are_projected=True,
+                or request_prefill_input_embeds is not None
             )
-        elif feedback_input_embeds is not None:
-            batch_result = self._forward_talker(
-                forward_batch,
-                input_embeds=feedback_input_embeds,
-                input_embeds_are_projected=True,
+            projected_prefill = (
+                self._is_talker_model
+                and schedule_batch.forward_mode.is_extend()
+                and has_projected_prefill
             )
-        else:
-            batch_result = self.model_worker.forward_batch_generation(forward_batch)
+            if omni_embeds is not None and omni_embeds[0] is not None:
+                input_embeds, ds_embeds, vis_masks = omni_embeds
+                batch_result = self._forward_with_omni_embeds(
+                    forward_batch, input_embeds, ds_embeds, vis_masks
+                )
+            elif projected_prefill:
+                projected_input_embeds = request_prefill_input_embeds
+                if projected_input_embeds is None:
+                    projected_input_embeds = forward_batch.input_embeds
+                if projected_input_embeds is None:
+                    raise RuntimeError(
+                        "Projected talker prefill requested without input_embeds"
+                    )
+                batch_result = self._forward_talker(
+                    forward_batch,
+                    input_embeds=projected_input_embeds,
+                    input_embeds_are_projected=True,
+                )
+            elif feedback_input_embeds is not None:
+                batch_result = self._forward_talker(
+                    forward_batch,
+                    input_embeds=feedback_input_embeds,
+                    input_embeds_are_projected=True,
+                )
+            else:
+                batch_result = self.model_worker.forward_batch_generation(forward_batch)
 
-        if schedule_batch.is_prefill_only:
-            batch_result.next_token_ids = torch.zeros(
-                len(model_worker_batch.seq_lens),
-                dtype=torch.long,
-                device=model_worker_batch.input_ids.device,
-            )
-        else:
-            self._apply_repetition_penalty(
-                batch_result.logits_output, scheduler_output.requests
-            )
-            self._apply_codec_suppress_tokens(
-                batch_result.logits_output, scheduler_output.requests
-            )
-            batch_result.next_token_ids = self.model_worker.model_runner.sample(
-                batch_result.logits_output, forward_batch
-            )
-        schedule_batch.output_ids = batch_result.next_token_ids
+            if schedule_batch.is_prefill_only:
+                batch_result.next_token_ids = torch.zeros(
+                    len(model_worker_batch.seq_lens),
+                    dtype=torch.long,
+                    device=model_worker_batch.input_ids.device,
+                )
+            else:
+                self._apply_repetition_penalty(
+                    batch_result.logits_output, scheduler_output.requests
+                )
+                self._apply_codec_suppress_tokens(
+                    batch_result.logits_output, scheduler_output.requests
+                )
+                batch_result.next_token_ids = self.model_worker.model_runner.sample(
+                    batch_result.logits_output, forward_batch
+                )
+            schedule_batch.output_ids = batch_result.next_token_ids
 
-        if self.batch_planner is not None:
-            self.batch_planner.record_last_batch(schedule_batch)
+            if self.batch_planner is not None:
+                self.batch_planner.record_last_batch(schedule_batch)
 
-        outputs = self.output_processor.process(batch_result, scheduler_output)
-        req_ids = [req.request_id for req in scheduler_output.requests]
-        req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+            outputs = self.output_processor.process(batch_result, scheduler_output)
+            req_ids = [req.request_id for req in scheduler_output.requests]
+            req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
 
-        return ModelRunnerOutput(
-            outputs=outputs,
-            req_ids=req_ids,
-            req_id_to_index=req_id_to_index,
-        )
+            return ModelRunnerOutput(
+                outputs=outputs,
+                req_ids=req_ids,
+                req_id_to_index=req_id_to_index,
+            )
+        finally:
+            if adapter_model is not None:
+                adapter_model.clear_native_adapter_requests()

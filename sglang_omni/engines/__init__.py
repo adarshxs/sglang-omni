@@ -5,7 +5,6 @@ from sglang_omni.engines.omni import (
     create_ar_engine,
     create_encoder_engine,
     create_sglang_ar_engine,
-    create_sglang_native_adapter_engine,
 )
 
 __all__ = [
@@ -14,5 +13,4 @@ __all__ = [
     "create_ar_engine",
     "create_encoder_engine",
     "create_sglang_ar_engine",
-    "create_sglang_native_adapter_engine",
 ]
